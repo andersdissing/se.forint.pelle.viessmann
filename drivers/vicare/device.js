@@ -54,10 +54,16 @@ module.exports = class ViessmannDevice extends OAuth2Device {
     }
 
     this._listeners = [];
+    this._lastPowerTimestamp = this.getStoreValue('lastPowerTimestamp') || null;
 
     await this.initializeCapabilities();
     await this.initializeOperatingModes();
     await this.registerCapabilityListeners();
+
+    const lastMeasurePower = this.getStoreValue('lastMeasurePower');
+    if (typeof lastMeasurePower === 'number') {
+      await this.setCapabilityValueIfPossible('measure_power', lastMeasurePower);
+    }
 
     this.onFeaturesUpdated = this.onFeaturesUpdated.bind(this);
 
@@ -281,6 +287,17 @@ module.exports = class ViessmannDevice extends OAuth2Device {
       await this.updateCapabilityOptions();
       this.setStoreValue('version', '1.0.9');
     }
+    // 1.0.15: refresh features from API to pick up new config entries (e.g. heating.power.consumption.total)
+    if (this.storeVersionBefore('1.0.15')) {
+      this.log('Upgrading to 1.0.15: refreshing features from API');
+      const installationId = this.getStoreValue('installationId');
+      const gatewaySerial = this.getStoreValue('gatewaySerial');
+      const deviceId = this.getStoreValue('deviceId');
+      const { features, constraints } = await this.driver._getEnabledFeaturesAndOpModes(this.oAuth2Client, installationId, gatewaySerial, deviceId);
+      this.setStoreValue('features', features);
+      this.setStoreValue('constraints', constraints);
+      this.setStoreValue('version', '1.0.15');
+    }
   }
 
   async onFeaturesUpdated(response, extendedResponse) {
@@ -353,6 +370,9 @@ module.exports = class ViessmannDevice extends OAuth2Device {
 
         // Update all capabilities associated with this feature
         for (const capability of featureConfig.capabilities) {
+          // Derived capabilities are computed elsewhere (e.g. measure_power from kWh delta)
+          if (capability.derived) continue;
+
           const value = getValue(feature.properties, capability.propertyPath);
           if (value !== undefined) {
             if (process.env.DEBUG) {
@@ -361,6 +381,49 @@ module.exports = class ViessmannDevice extends OAuth2Device {
             await this.setCapabilityValueIfPossible(capability.capabilityName, value);
           } else if (process.env.DEBUG) {
             this.log(`No value found for capability: ${capability.capabilityName}, path: ${capability.propertyPath}`);
+          }
+        }
+
+        // Viessmann's day[0] is today's kWh and resets at midnight. Homey's Energy tab requires
+        // a monotonically increasing meter_power (energy.cumulative: true), so accumulate positive
+        // deltas into a lifetime total persisted in device store. measure_power (W) is derived
+        // from the same delta over elapsed time.
+        if (feature.feature === PATHS.POWER_CONSUMPTION_TOTAL) {
+          const todayKwh = getValue(feature.properties, 'day.value.0');
+          if (typeof todayKwh === 'number') {
+            const now = Date.now();
+            const lastDayKwh = this.getStoreValue('lastDayKwh');
+            const previousLifetime = this.getStoreValue('lifetimeKwh');
+            const lifetimeBase = typeof previousLifetime === 'number' ? previousLifetime : 0;
+
+            let deltaKwh;
+            if (typeof lastDayKwh !== 'number') {
+              // First reading after install/upgrade — seed the lifetime total with today's value
+              deltaKwh = todayKwh;
+            } else if (todayKwh >= lastDayKwh) {
+              deltaKwh = todayKwh - lastDayKwh;
+            } else {
+              // Midnight reset — yesterday's final is already in the lifetime total
+              deltaKwh = todayKwh;
+            }
+
+            const lifetimeKwh = lifetimeBase + deltaKwh;
+            await this.setStoreValue('lifetimeKwh', lifetimeKwh);
+            await this.setStoreValue('lastDayKwh', todayKwh);
+            await this.setCapabilityValueIfPossible('meter_power', lifetimeKwh);
+
+            if (deltaKwh > 0) {
+              if (this._lastPowerTimestamp !== null) {
+                const deltaHours = (now - this._lastPowerTimestamp) / 3600000;
+                if (deltaHours > 0) {
+                  const watts = (deltaKwh / deltaHours) * 1000;
+                  await this.setStoreValue('lastMeasurePower', watts);
+                  await this.setCapabilityValueIfPossible('measure_power', watts);
+                }
+              }
+              this._lastPowerTimestamp = now;
+              await this.setStoreValue('lastPowerTimestamp', now);
+            }
           }
         }
       }
@@ -463,6 +526,13 @@ module.exports = class ViessmannDevice extends OAuth2Device {
     // Stop polling for this device
     const deviceKey = `${this._installationId}-${this._gatewaySerial}-${this._deviceId}`;
     this.driver._stopPolling(deviceKey);
+  }
+
+  async onSettings({ changedKeys }) {
+    if (changedKeys.includes('pollInterval')) {
+      const deviceKey = `${this._installationId}-${this._gatewaySerial}-${this._deviceId}`;
+      await this.driver._startPolling(this, deviceKey);
+    }
   }
 
   // Method to handle dynamic feature paths based on installation

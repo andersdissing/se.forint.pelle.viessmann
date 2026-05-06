@@ -50,6 +50,7 @@ const PATHS = {
   FUEL_CELL_STATS: 'fuelCell.statistics',
   FUEL_CELL_PHASE: 'fuelCell.operating.phase',
   FUEL_CELL_MODE: 'fuelCell.operating.modes.active',
+  POWER_CONSUMPTION_TOTAL: 'heating.power.consumption.total',
 };
 
 // Gemensamma capability-mallar
@@ -391,6 +392,30 @@ module.exports = {
           },
         },
       }],
+    },
+    [PATHS.POWER_CONSUMPTION_TOTAL]: {
+      capabilities: [
+        {
+          capabilityName: 'meter_power',
+          propertyPath: '_derived',
+          derived: true,
+          capabilityOptions: {
+            title: { en: 'Energy' },
+            units: 'kWh',
+            decimals: 3,
+          },
+        },
+        {
+          capabilityName: 'measure_power',
+          propertyPath: '_derived',
+          derived: true,
+          capabilityOptions: {
+            title: { en: 'Power' },
+            units: 'W',
+            decimals: 0,
+          },
+        },
+      ],
     },
     [PATHS.FUEL_CELL_MODE]: {
       capabilities: [{
