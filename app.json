@@ -348,9 +348,20 @@
       "class": "heater",
       "capabilities": [
         "meter_power",
-        "measure_power"
+        "measure_power",
+        "button.refresh"
       ],
-      "capabilitiesOptions": {},
+      "capabilitiesOptions": {
+        "button.refresh": {
+          "title": {
+            "en": "Refresh"
+          },
+          "desc": {
+            "en": "Fetch the latest data from the Viessmann API now"
+          },
+          "maintenanceAction": true
+        }
+      },
       "energy": {},
       "platforms": [
         "local"

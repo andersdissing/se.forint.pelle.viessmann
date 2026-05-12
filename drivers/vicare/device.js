@@ -29,6 +29,7 @@ module.exports = class ViessmannDevice extends OAuth2Device {
 
   static FEATURES = FEATURES;
   static PATHS = PATHS;
+  static STATIC_CAPABILITIES = ['button.refresh'];
 
   async onOAuth2Init() {
     await this.checkUpgradeSpecifics();
@@ -54,15 +55,20 @@ module.exports = class ViessmannDevice extends OAuth2Device {
     }
 
     this._listeners = [];
-    this._lastPowerTimestamp = this.getStoreValue('lastPowerTimestamp') || null;
 
     await this.initializeCapabilities();
     await this.initializeOperatingModes();
     await this.registerCapabilityListeners();
 
+    this.registerCapabilityListener('button.refresh', async () => {
+      this.log('Manual refresh requested');
+      const deviceKey = `${this._installationId}-${this._gatewaySerial}-${this._deviceId}`;
+      await this.driver._startPolling(this, deviceKey);
+    });
+
     const lastMeasurePower = this.getStoreValue('lastMeasurePower');
     if (typeof lastMeasurePower === 'number') {
-      await this.setCapabilityValueIfPossible('measure_power', lastMeasurePower);
+      await this.setCapabilityValueIfPossible('measure_power', Math.max(0, lastMeasurePower));
     }
 
     this.onFeaturesUpdated = this.onFeaturesUpdated.bind(this);
@@ -79,8 +85,16 @@ module.exports = class ViessmannDevice extends OAuth2Device {
   }
 
   async initializeCapabilities() {
+    // Ensure static (non-feature-driven) capabilities are always present
+    for (const cap of this.constructor.STATIC_CAPABILITIES) {
+      if (!this.hasCapability(cap)) {
+        await this.addCapability(cap);
+      }
+    }
+
     // Remove capabilities that are no longer in config or don't match device roles
     for (const existingCap of this.getCapabilities()) {
+      if (this.constructor.STATIC_CAPABILITIES.includes(existingCap)) continue;
       let shouldKeep = false;
       for (const path of Object.values(PATHS)) {
         try {
@@ -387,43 +401,61 @@ module.exports = class ViessmannDevice extends OAuth2Device {
         // Viessmann's day[0] is today's kWh and resets at midnight. Homey's Energy tab requires
         // a monotonically increasing meter_power (energy.cumulative: true), so accumulate positive
         // deltas into a lifetime total persisted in device store. measure_power (W) is derived
-        // from the same delta over elapsed time.
+        // from the API's own update timestamp (feature.timestamp) — using wall-clock poll time
+        // produces fake spikes when a 0.1 kWh chunk that accumulated over hours is attributed to
+        // the gap between two polls.
         if (feature.feature === PATHS.POWER_CONSUMPTION_TOTAL) {
           const todayKwh = getValue(feature.properties, 'day.value.0');
-          if (typeof todayKwh === 'number') {
-            const now = Date.now();
+          const apiTimestampMs = feature.timestamp ? Date.parse(feature.timestamp) : NaN;
+          this.log(`[power] raw day.value.0 = ${todayKwh} apiTimestamp = ${feature.timestamp}`);
+          if (typeof todayKwh === 'number' && Number.isFinite(apiTimestampMs)) {
             const lastDayKwh = this.getStoreValue('lastDayKwh');
+            const lastApiTimestamp = this.getStoreValue('lastApiTimestamp');
             const previousLifetime = this.getStoreValue('lifetimeKwh');
             const lifetimeBase = typeof previousLifetime === 'number' ? previousLifetime : 0;
 
             let deltaKwh;
+            let deltaReason;
             if (typeof lastDayKwh !== 'number') {
-              // First reading after install/upgrade — seed the lifetime total with today's value
               deltaKwh = todayKwh;
+              deltaReason = 'first reading (seeded)';
             } else if (todayKwh >= lastDayKwh) {
               deltaKwh = todayKwh - lastDayKwh;
+              deltaReason = 'today >= last';
             } else {
-              // Midnight reset — yesterday's final is already in the lifetime total
               deltaKwh = todayKwh;
+              deltaReason = 'midnight reset';
             }
 
             const lifetimeKwh = lifetimeBase + deltaKwh;
+            const apiAdvanced = typeof lastApiTimestamp === 'number' && apiTimestampMs > lastApiTimestamp;
+            const deltaHours = typeof lastApiTimestamp === 'number'
+              ? (apiTimestampMs - lastApiTimestamp) / 3600000
+              : null;
+            this.log(
+              `[power] todayKwh=${todayKwh} lastDayKwh=${lastDayKwh} deltaKwh=${deltaKwh} (${deltaReason}) `
+              + `lifetimeBase=${lifetimeBase} lifetimeKwh=${lifetimeKwh} `
+              + `lastApiTimestamp=${lastApiTimestamp} apiAdvanced=${apiAdvanced} deltaHours=${deltaHours}`,
+            );
+
             await this.setStoreValue('lifetimeKwh', lifetimeKwh);
             await this.setStoreValue('lastDayKwh', todayKwh);
             await this.setCapabilityValueIfPossible('meter_power', lifetimeKwh);
 
-            if (deltaKwh > 0) {
-              if (this._lastPowerTimestamp !== null) {
-                const deltaHours = (now - this._lastPowerTimestamp) / 3600000;
-                if (deltaHours > 0) {
-                  const watts = (deltaKwh / deltaHours) * 1000;
-                  await this.setStoreValue('lastMeasurePower', watts);
-                  await this.setCapabilityValueIfPossible('measure_power', watts);
-                }
-              }
-              this._lastPowerTimestamp = now;
-              await this.setStoreValue('lastPowerTimestamp', now);
+            if (apiAdvanced && deltaHours > 0) {
+              const watts = Math.max(0, (deltaKwh / deltaHours) * 1000);
+              this.log(`[power] measure_power = ${watts} W (deltaKwh=${deltaKwh} / deltaHours=${deltaHours} * 1000)`);
+              await this.setStoreValue('lastMeasurePower', watts);
+              await this.setCapabilityValueIfPossible('measure_power', watts);
+              await this.setStoreValue('lastApiTimestamp', apiTimestampMs);
+            } else if (typeof lastApiTimestamp !== 'number') {
+              this.log('[power] first reading — recording API timestamp, deferring measure_power until next update');
+              await this.setStoreValue('lastApiTimestamp', apiTimestampMs);
+            } else {
+              this.log(`[power] API counter not advanced yet (last=${lastApiTimestamp}, now=${apiTimestampMs}) — leaving measure_power unchanged`);
             }
+          } else {
+            this.log(`[power] todayKwh not a number, skipping (type=${typeof todayKwh})`);
           }
         }
       }
