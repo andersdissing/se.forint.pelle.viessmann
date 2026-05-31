@@ -30,6 +30,13 @@ module.exports = class ViessmannDevice extends OAuth2Device {
   static FEATURES = FEATURES;
   static PATHS = PATHS;
   static STATIC_CAPABILITIES = ['button.refresh'];
+  // If the Viessmann API timestamp on the summary.* features stops
+  // advancing for longer than this, assume the heat pump is idle and
+  // force measure_power to 0. Otherwise the capability stays stuck at
+  // whatever watts value was computed from the last positive delta —
+  // observed: 7181 W left over from an earlier active cycle while the
+  // device was actually drawing 0 W.
+  static MAX_STALE_POWER_MS = 15 * 60 * 1000;
 
   async onOAuth2Init() {
     await this.checkUpgradeSpecifics();
@@ -312,6 +319,38 @@ module.exports = class ViessmannDevice extends OAuth2Device {
       this.setStoreValue('constraints', constraints);
       this.setStoreValue('version', '1.0.15');
     }
+    // 1.0.16: meter_power / measure_power source switched from
+    // heating.power.consumption.total (whose inner `day` array can be 40+
+    // hours stale) to the sum of heating.power.consumption.summary.*
+    // currentDay values. Refresh _features so the new paths are recognised,
+    // and reset the accumulator's per-day cache so the next poll seeds
+    // cleanly from the new source instead of computing a spurious delta
+    // against the old `day.value[0]` value.
+    if (this.storeVersionBefore('1.0.16')) {
+      this.log('Upgrading to 1.0.16: switching power source to summary.*');
+      const installationId = this.getStoreValue('installationId');
+      const gatewaySerial = this.getStoreValue('gatewaySerial');
+      const deviceId = this.getStoreValue('deviceId');
+      const { features, constraints } = await this.driver._getEnabledFeaturesAndOpModes(this.oAuth2Client, installationId, gatewaySerial, deviceId);
+      this.setStoreValue('features', features);
+      this.setStoreValue('constraints', constraints);
+      await this.unsetStoreValue('lastDayKwh');
+      await this.unsetStoreValue('lastApiTimestamp');
+      this.setStoreValue('version', '1.0.16');
+    }
+    // 1.0.17: live measure_power derivation from compressor + fan. Refresh
+    // _features so the new compressor.speed.current and primary fan paths
+    // are recognised by the polling loop.
+    if (this.storeVersionBefore('1.0.17')) {
+      this.log('Upgrading to 1.0.17: refreshing features for live-wattage paths');
+      const installationId = this.getStoreValue('installationId');
+      const gatewaySerial = this.getStoreValue('gatewaySerial');
+      const deviceId = this.getStoreValue('deviceId');
+      const { features, constraints } = await this.driver._getEnabledFeaturesAndOpModes(this.oAuth2Client, installationId, gatewaySerial, deviceId);
+      this.setStoreValue('features', features);
+      this.setStoreValue('constraints', constraints);
+      this.setStoreValue('version', '1.0.17');
+    }
   }
 
   async onFeaturesUpdated(response, extendedResponse) {
@@ -341,6 +380,39 @@ module.exports = class ViessmannDevice extends OAuth2Device {
         }
       }
 
+      // Helper to safely get nested property values; hoisted out of the loop so
+      // the post-loop power aggregation can reuse it.
+      const getValue = (obj, path) => {
+        try {
+          return path.split('.').reduce((acc, part) => acc && acc[part], obj);
+        } catch (error) {
+          if (process.env.DEBUG) {
+            this.log(`Error getting value for path: ${path}, error:`, error);
+          }
+          return undefined;
+        }
+      };
+
+      // Collect today's kWh from the three summary.* features as they pass
+      // through the loop, then aggregate into meter_power / measure_power once
+      // the loop has finished. See the long comment below the loop for why.
+      const POWER_SUMMARY_PATHS = [
+        PATHS.POWER_CONSUMPTION_SUMMARY_HEATING,
+        PATHS.POWER_CONSUMPTION_SUMMARY_DHW,
+        PATHS.POWER_CONSUMPTION_SUMMARY_COOLING,
+      ];
+      const summaryCurrentDay = {};
+      let latestSummaryTimestampMs = null;
+
+      // Live activity signals — used to derive an instantaneous measure_power
+      // estimate, since the API has no direct wattage sensor on most Vitocal
+      // models (heating.inverters.0.sensors.power.current returns
+      // status=notConnected). compressor.active updates within ~30s vs. the
+      // kWh-summary counters which tick only every 5–20 min.
+      let compressorActive = null;
+      let compressorSpeedRps = null;
+      let fanModulationPct = null;
+
       for (const feature of response.data) {
         if (!feature.isEnabled || !feature.properties || feature.properties?.status?.value === 'notConnected') {
           if (process.env.DEBUG && !extendedResponse) {
@@ -365,23 +437,6 @@ module.exports = class ViessmannDevice extends OAuth2Device {
           continue;
         }
 
-        if (process.env.DEBUG && !extendedResponse) {
-          // this.log(`Processing feature: ${feature.feature}`);
-        }
-
-        // Helper function to safely get nested property values
-        const getValue = (obj, path) => {
-          // if error, return undefined
-          try {
-            return path.split('.').reduce((acc, part) => acc && acc[part], obj);
-          } catch (error) {
-            if (process.env.DEBUG) {
-              this.log(`Error getting value for path: ${path}, error:`, error);
-            }
-            return undefined;
-          }
-        };
-
         // Update all capabilities associated with this feature
         for (const capability of featureConfig.capabilities) {
           // Derived capabilities are computed elsewhere (e.g. measure_power from kWh delta)
@@ -389,73 +444,139 @@ module.exports = class ViessmannDevice extends OAuth2Device {
 
           const value = getValue(feature.properties, capability.propertyPath);
           if (value !== undefined) {
-            if (process.env.DEBUG) {
-              // this.log(`Setting capability: ${capability.capabilityName} = ${value} (from ${capability.propertyPath})`);
-            }
             await this.setCapabilityValueIfPossible(capability.capabilityName, value);
           } else if (process.env.DEBUG) {
             this.log(`No value found for capability: ${capability.capabilityName}, path: ${capability.propertyPath}`);
           }
         }
 
-        // Viessmann's day[0] is today's kWh and resets at midnight. Homey's Energy tab requires
-        // a monotonically increasing meter_power (energy.cumulative: true), so accumulate positive
-        // deltas into a lifetime total persisted in device store. measure_power (W) is derived
-        // from the API's own update timestamp (feature.timestamp) — using wall-clock poll time
-        // produces fake spikes when a 0.1 kWh chunk that accumulated over hours is attributed to
-        // the gap between two polls.
-        if (feature.feature === PATHS.POWER_CONSUMPTION_TOTAL) {
-          const todayKwh = getValue(feature.properties, 'day.value.0');
-          const apiTimestampMs = feature.timestamp ? Date.parse(feature.timestamp) : NaN;
-          this.log(`[power] raw day.value.0 = ${todayKwh} apiTimestamp = ${feature.timestamp}`);
-          if (typeof todayKwh === 'number' && Number.isFinite(apiTimestampMs)) {
-            const lastDayKwh = this.getStoreValue('lastDayKwh');
-            const lastApiTimestamp = this.getStoreValue('lastApiTimestamp');
-            const previousLifetime = this.getStoreValue('lifetimeKwh');
-            const lifetimeBase = typeof previousLifetime === 'number' ? previousLifetime : 0;
-
-            let deltaKwh;
-            let deltaReason;
-            if (typeof lastDayKwh !== 'number') {
-              deltaKwh = todayKwh;
-              deltaReason = 'first reading (seeded)';
-            } else if (todayKwh >= lastDayKwh) {
-              deltaKwh = todayKwh - lastDayKwh;
-              deltaReason = 'today >= last';
-            } else {
-              deltaKwh = todayKwh;
-              deltaReason = 'midnight reset';
+        if (POWER_SUMMARY_PATHS.includes(feature.feature)) {
+          const currentDay = getValue(feature.properties, 'currentDay.value');
+          if (typeof currentDay === 'number') {
+            summaryCurrentDay[feature.feature] = currentDay;
+            const tsMs = feature.timestamp ? Date.parse(feature.timestamp) : NaN;
+            if (Number.isFinite(tsMs) && (latestSummaryTimestampMs === null || tsMs > latestSummaryTimestampMs)) {
+              latestSummaryTimestampMs = tsMs;
             }
+          }
+        }
+        if (feature.feature === PATHS.COMPRESSOR) {
+          const v = getValue(feature.properties, 'active.value');
+          if (typeof v === 'boolean') compressorActive = v;
+        }
+        if (feature.feature === PATHS.COMPRESSOR_SPEED) {
+          const v = getValue(feature.properties, 'value.value');
+          if (typeof v === 'number') compressorSpeedRps = v;
+        }
+        if (feature.feature === PATHS.PRIMARY_FAN_MODULATION) {
+          const v = getValue(feature.properties, 'value.value');
+          if (typeof v === 'number') fanModulationPct = v;
+        }
+      }
 
-            const lifetimeKwh = lifetimeBase + deltaKwh;
-            const apiAdvanced = typeof lastApiTimestamp === 'number' && apiTimestampMs > lastApiTimestamp;
-            const deltaHours = typeof lastApiTimestamp === 'number'
-              ? (apiTimestampMs - lastApiTimestamp) / 3600000
-              : null;
-            this.log(
-              `[power] todayKwh=${todayKwh} lastDayKwh=${lastDayKwh} deltaKwh=${deltaKwh} (${deltaReason}) `
-              + `lifetimeBase=${lifetimeBase} lifetimeKwh=${lifetimeKwh} `
-              + `lastApiTimestamp=${lastApiTimestamp} apiAdvanced=${apiAdvanced} deltaHours=${deltaHours}`,
-            );
+      // Aggregate today's kWh from the three summary.* features and feed the
+      // monotonic lifetime accumulator (Homey's Energy tab requires meter_power
+      // to be cumulative). measure_power is derived from the delta over the
+      // API's own timestamp, not wall-clock poll time, to avoid fake spikes
+      // when a chunk that accumulated over hours is attributed to the gap
+      // between two polls.
+      //
+      // Why summary.* instead of heating.power.consumption.total: the
+      // outer feature.timestamp on `.total` updates each poll, but the inner
+      // `dayValueReadAt` can be 40+ hours stale on some devices (observed on
+      // Vitocal 222S), so the old `day.value[0]`-based path silently froze.
+      // The summary.{heating,dhw,cooling} features expose a fresh
+      // `currentDay` property whose values sum to the figure shown in the
+      // Viessmann mobile app.
+      // First: kWh accumulator (meter_power, always — this is the lifetime
+      // counter Homey's Energy tab requires). Capture deltaKwh/apiAdvanced so
+      // the measure_power fallback below can reuse them without re-reading
+      // state that has just been updated.
+      let kwhDeltaKwh = null;
+      let kwhApiAdvanced = false;
+      let kwhDeltaHours = null;
+      const summaryKeys = Object.keys(summaryCurrentDay);
+      if (summaryKeys.length > 0 && latestSummaryTimestampMs !== null) {
+        const todayKwh = Object.values(summaryCurrentDay).reduce((sum, v) => sum + v, 0);
+        const apiTimestampMs = latestSummaryTimestampMs;
+        const breakdown = summaryKeys.map((k) => `${k.split('.').pop()}=${summaryCurrentDay[k]}`).join(' ');
 
-            await this.setStoreValue('lifetimeKwh', lifetimeKwh);
-            await this.setStoreValue('lastDayKwh', todayKwh);
-            await this.setCapabilityValueIfPossible('meter_power', lifetimeKwh);
+        const lastDayKwh = this.getStoreValue('lastDayKwh');
+        const lastApiTimestamp = this.getStoreValue('lastApiTimestamp');
+        const previousLifetime = this.getStoreValue('lifetimeKwh');
+        const lifetimeBase = typeof previousLifetime === 'number' ? previousLifetime : 0;
 
-            if (apiAdvanced && deltaHours > 0) {
-              const watts = Math.max(0, (deltaKwh / deltaHours) * 1000);
-              this.log(`[power] measure_power = ${watts} W (deltaKwh=${deltaKwh} / deltaHours=${deltaHours} * 1000)`);
-              await this.setStoreValue('lastMeasurePower', watts);
-              await this.setCapabilityValueIfPossible('measure_power', watts);
-              await this.setStoreValue('lastApiTimestamp', apiTimestampMs);
-            } else if (typeof lastApiTimestamp !== 'number') {
-              this.log('[power] first reading — recording API timestamp, deferring measure_power until next update');
-              await this.setStoreValue('lastApiTimestamp', apiTimestampMs);
-            } else {
-              this.log(`[power] API counter not advanced yet (last=${lastApiTimestamp}, now=${apiTimestampMs}) — leaving measure_power unchanged`);
+        let deltaReason;
+        if (typeof lastDayKwh !== 'number') {
+          kwhDeltaKwh = todayKwh;
+          deltaReason = 'first reading (seeded)';
+        } else if (todayKwh >= lastDayKwh) {
+          kwhDeltaKwh = todayKwh - lastDayKwh;
+          deltaReason = 'today >= last';
+        } else {
+          kwhDeltaKwh = todayKwh;
+          deltaReason = 'midnight reset';
+        }
+
+        const lifetimeKwh = lifetimeBase + kwhDeltaKwh;
+        kwhApiAdvanced = typeof lastApiTimestamp === 'number' && apiTimestampMs > lastApiTimestamp;
+        kwhDeltaHours = typeof lastApiTimestamp === 'number'
+          ? (apiTimestampMs - lastApiTimestamp) / 3600000 : null;
+        this.log(
+          `[power] todayKwh=${todayKwh} (${breakdown}) lastDayKwh=${lastDayKwh} deltaKwh=${kwhDeltaKwh} (${deltaReason}) `
+          + `lifetimeKwh=${lifetimeKwh} apiAdvanced=${kwhApiAdvanced} deltaHours=${kwhDeltaHours}`,
+        );
+
+        await this.setStoreValue('lifetimeKwh', lifetimeKwh);
+        await this.setStoreValue('lastDayKwh', todayKwh);
+        await this.setCapabilityValueIfPossible('meter_power', lifetimeKwh);
+
+        if (kwhApiAdvanced || typeof lastApiTimestamp !== 'number') {
+          await this.setStoreValue('lastApiTimestamp', apiTimestampMs);
+        }
+      }
+
+      // measure_power derivation. Prefer the live compressor-based estimate
+      // when the user has maxCompressorW > 0 — it tracks the heat pump within
+      // ~30 s of the compressor turning on/off, instead of lagging the kWh
+      // summary chunks by 5–20 min. Falls back to the kWh-delta path when the
+      // compressor signals are missing or the user has disabled the live
+      // estimate (maxCompressorW = 0).
+      // Setting defaults apply only to newly-paired devices. For existing
+      // devices the setting comes back undefined, so apply the same defaults
+      // in code as in driver.compose.json.
+      const rawMaxW = Number(this.getSetting('maxCompressorW'));
+      const rawBaseW = Number(this.getSetting('baselineW'));
+      const maxCompressorW = Number.isFinite(rawMaxW) ? rawMaxW : 3500;
+      const baselineW = Number.isFinite(rawBaseW) ? rawBaseW : 150;
+      const MAX_COMPRESSOR_RPS = 120;
+
+      if (maxCompressorW > 0 && typeof compressorActive === 'boolean') {
+        let watts;
+        if (compressorActive) {
+          const speedRatio = Math.min(1, Math.max(0, (compressorSpeedRps || 0) / MAX_COMPRESSOR_RPS));
+          watts = baselineW + speedRatio * maxCompressorW;
+        } else {
+          watts = baselineW;
+        }
+        this.log(`[power] measure_power (live) = ${Math.round(watts)} W  compressor=${compressorActive} speed=${compressorSpeedRps}rps fan=${fanModulationPct}%`);
+        await this.setStoreValue('lastMeasurePower', watts);
+        await this.setCapabilityValueIfPossible('measure_power', watts);
+      } else if (kwhDeltaKwh !== null) {
+        if (kwhApiAdvanced && kwhDeltaHours > 0) {
+          const watts = Math.max(0, (kwhDeltaKwh / kwhDeltaHours) * 1000);
+          this.log(`[power] measure_power (kWh-delta) = ${Math.round(watts)} W`);
+          await this.setStoreValue('lastMeasurePower', watts);
+          await this.setCapabilityValueIfPossible('measure_power', watts);
+        } else {
+          const lastApiTimestamp = this.getStoreValue('lastApiTimestamp');
+          if (typeof lastApiTimestamp === 'number') {
+            const staleMs = Date.now() - lastApiTimestamp;
+            if (staleMs > this.constructor.MAX_STALE_POWER_MS) {
+              this.log(`[power] API timestamp stale for ${Math.round(staleMs / 60000)} min — assuming idle, setting measure_power=0`);
+              await this.setStoreValue('lastMeasurePower', 0);
+              await this.setCapabilityValueIfPossible('measure_power', 0);
             }
-          } else {
-            this.log(`[power] todayKwh not a number, skipping (type=${typeof todayKwh})`);
           }
         }
       }
@@ -560,10 +681,16 @@ module.exports = class ViessmannDevice extends OAuth2Device {
     this.driver._stopPolling(deviceKey);
   }
 
-  async onSettings({ changedKeys }) {
+  async onSettings({ newSettings, changedKeys }) {
     if (changedKeys.includes('pollInterval')) {
       const deviceKey = `${this._installationId}-${this._gatewaySerial}-${this._deviceId}`;
-      await this.driver._startPolling(this, deviceKey);
+      // Pass the new value through explicitly. device.getSetting() inside
+      // onSettings can still return the OLD value before the change is
+      // committed, which is why the previous version of this handler
+      // appeared to "ignore" pollInterval changes until app restart.
+      const intervalMs = this.driver.constructor._toIntervalMs(newSettings.pollInterval);
+      this.log(`pollInterval changed to ${newSettings.pollInterval} min → restarting polling at ${intervalMs / 1000}s`);
+      await this.driver._startPolling(this, deviceKey, intervalMs);
     }
   }
 

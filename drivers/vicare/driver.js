@@ -116,13 +116,21 @@ module.exports = class ViessmannDriver extends OAuth2Driver {
     this.log('Finished registering flow cards');
   }
 
-  _calculatePollInterval(device) {
-    const { DEFAULT_POLL_INTERVAL_MINUTES, MIN_POLL_INTERVAL_MINUTES } = this.constructor;
-    const raw = Number(device.getSetting('pollInterval'));
-    const minutes = Number.isFinite(raw) && raw > 0
-      ? Math.max(raw, MIN_POLL_INTERVAL_MINUTES)
+  // Convert raw minutes (from a setting value or anywhere else) to a
+  // sanitised interval in milliseconds. Centralised so onSettings — where
+  // device.getSetting() may still return the previous value — can convert
+  // the new value directly without re-reading from settings.
+  static _toIntervalMs(rawMinutes) {
+    const { DEFAULT_POLL_INTERVAL_MINUTES, MIN_POLL_INTERVAL_MINUTES } = this;
+    const num = Number(rawMinutes);
+    const minutes = Number.isFinite(num) && num > 0
+      ? Math.max(num, MIN_POLL_INTERVAL_MINUTES)
       : DEFAULT_POLL_INTERVAL_MINUTES;
     return minutes * 60 * 1000;
+  }
+
+  _calculatePollInterval(device) {
+    return this.constructor._toIntervalMs(device.getSetting('pollInterval'));
   }
 
   async _startPolling(device, deviceKey, interval = null) {
@@ -139,7 +147,7 @@ module.exports = class ViessmannDriver extends OAuth2Driver {
         try {
           // get features with extended response every 30th poll (statisticaly)
           const extendedRequest = Math.random() < 0.03;
-          const features = await device.getFeatures({ useFilter: !extendedRequest });
+          const features = await device.getFeatures(!extendedRequest);
 
           consecutiveErrors = 0;
           if (!device.getAvailable()) {
