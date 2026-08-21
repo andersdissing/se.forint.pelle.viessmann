@@ -62,6 +62,17 @@
             "standby": "Standby"
           }
         },
+        "heating_program": {
+          "title": "Set heating program",
+          "titleFormatted": "Set heating program to [[program]]",
+          "hint": "Overrides the weekly time program of heating circuit 0. Comfort, Normal and Eco apply around the clock until you choose 'Back to my schedule', which restores the schedule that was in place before the first override. Eco uses the installation's reduced level.",
+          "values": {
+            "comfort": "Comfort",
+            "normal": "Normal",
+            "eco": "Eco (reduced)",
+            "auto": "Back to my schedule"
+          }
+        },
         "heating_temp": {
           "title": "Set heating target temperature to [[temperature]] °C",
           "temperature": "Temperature"
@@ -69,6 +80,19 @@
         "dhw_temp": {
           "title": "Set hot water Normal target temperature to [[temperature]] °C",
           "temperature": "Temperature"
+        },
+        "dhw_mode": {
+          "title": "Set hot water mode",
+          "titleFormatted": "Set hot water mode to [[mode]]",
+          "hint": "Hot water has its own operating mode, separate from the heating circuit — this is the Eco/Comfort setting shown under hot water in the ViCare app. Heat pumps offer Eco, Comfort and Off; the modes marked (boiler) exist only on boilers and will be refused on a heat pump.",
+          "values": {
+            "efficient": "Eco",
+            "efficientWithMinComfort": "Comfort",
+            "off": "Off",
+            "eco": "Eco (boiler)",
+            "comfort": "Comfort (boiler)",
+            "balanced": "Balanced (boiler)"
+          }
         },
         "dhw_charge": {
           "title": "Set one time hot water charge",

@@ -18,7 +18,9 @@
     "postpublish": "node scripts/restoreDocumentation.js",
     "doc": "node scripts/restoreDocumentation.js",
     "nodoc": "node scripts/moveDocumentation.js",
-    "test": "jest --config jest.config.js"
+    "test": "jest --config jest.config.js",
+    "test:connection": "node scripts/testConnection.js",
+    "test:programs": "node scripts/testProgramSwitch.js"
   },
   "devDependencies": {
     "@tsconfig/node18": "^18.2.4",

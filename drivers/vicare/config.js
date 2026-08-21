@@ -28,7 +28,21 @@ const PATHS = {
   HOT_WATER_TARGET_2: 'heating.dhw.temperature.temp2',
   HEATING_CIRCUIT_0_TARGET: 'heating.circuits.0.operating.programs.normal',
   HOT_WATER_CHARGE: 'heating.dhw.oneTimeCharge',
+  // Hot water has its OWN operating mode, separate from the heating circuit's.
+  // On E3 heat pumps the circuit mode is heating/standby only and everything
+  // about hot water lives under heating.dhw.*, so this is the feature to write
+  // to turn hot water off or change how eagerly it is produced.
+  HOT_WATER_MODE: 'heating.dhw.operating.modes.active',
   HEATING_CIRCUIT_0_MODE: 'heating.circuits.0.operating.modes.active',
+  // Weekly time program for the heating circuit. On E3 devices this is the
+  // ONLY writable way to select the Comfort / Normal / Eco (reduced)
+  // temperature level: the operating.programs.* features expose activate /
+  // deactivate as isExecutable:false. See device.js:setHeatingProgram.
+  HEATING_CIRCUIT_0_SCHEDULE: 'heating.circuits.0.heating.schedule',
+  // Which temperature level the circuit is running right now. This is what
+  // changes when the set-heating-program flow action rewrites the schedule —
+  // without it nothing in Homey reflects a Comfort/Eco switch.
+  HEATING_CIRCUIT_0_PROGRAM_ACTIVE: 'heating.circuits.0.operating.programs.active',
   OUTSIDE_TEMP: 'heating.sensors.temperature.outside',
   HEATING_CIRCUIT_0_ROOM_TEMPERATURE: 'heating.circuits.0.sensors.temperature.room',
   HEATING_CIRCUIT_0_TEMPERATURE: 'heating.circuits.0.temperature',
@@ -434,6 +448,105 @@ module.exports = {
     // "unknown feature".
     [PATHS.POWER_CONSUMPTION_SUMMARY_DHW]: { capabilities: [] },
     [PATHS.POWER_CONSUMPTION_SUMMARY_COOLING]: { capabilities: [] },
+    // The heating schedule is written by the set-heating-program flow action,
+    // not mirrored into a capability. It still needs an entry here so the
+    // loops in device.js do not treat it as an unknown feature.
+    [PATHS.HEATING_CIRCUIT_0_SCHEDULE]: { capabilities: [] },
+    [PATHS.HOT_WATER_MODE]: {
+      capabilities: [{
+        capabilityName: 'thermostat_mode.hotWater',
+        propertyPath: 'value.value',
+        command: {
+          name: 'setMode',
+          parameterMapping: {
+            value: 'mode',
+          },
+        },
+        capabilityOptions: {
+          // Deliberately NOT "Hot water mode": Homey keys flow tags by title,
+          // and this device carries two capabilities for the same setting —
+          // this picker (raw ids) and measure_hot_water_mode (labels). Two
+          // identically titled capabilities collide and the tag resolves to
+          // an empty value, so the tag-facing one keeps the plain name and
+          // this control takes the longer one.
+          title: { en: 'Hot water operating mode' },
+          // The union of the modes seen across device generations: E3 heat
+          // pumps report efficient / efficientWithMinComfort / off, older
+          // boilers report off / eco / comfort / balanced. device.js prunes
+          // this list down to what the installation actually reports in its
+          // setMode constraints.
+          //
+          // The labels follow the ViCare app rather than the API: on a heat
+          // pump ViCare presents `efficient` as Eco and
+          // `efficientWithMinComfort` as Comfort. Naming them after the raw
+          // API values meant the app and the heat pump's own app disagreed
+          // about what the same setting was called. The boiler-only modes are
+          // marked so the two Eco/Comfort pairs cannot be confused in the flow
+          // card, whose dropdown cannot be filtered per device.
+          values: [
+            { id: 'efficient', title: { en: 'Eco' } },
+            { id: 'efficientWithMinComfort', title: { en: 'Comfort' } },
+            { id: 'off', title: { en: 'Off' } },
+            { id: 'eco', title: { en: 'Eco (boiler)' } },
+            { id: 'comfort', title: { en: 'Comfort (boiler)' } },
+            { id: 'balanced', title: { en: 'Balanced (boiler)' } },
+          ],
+          preventInsights: true,
+          // The flow tag for hot water comes from measure_hot_water_mode
+          // below, which carries "Eco"/"Comfort"/"Off" instead of the raw API
+          // ids. Two tags with the same title would be impossible to tell
+          // apart in Homey's tag picker, so this one is not offered as a tag.
+          preventTag: true,
+        },
+      },
+      // Read-only twin of the capability above, carrying the label instead of
+      // the id so a flow can store "Comfort" in a variable and branch on it.
+      // Declared exactly like measure_heating_program — a plain sensor — because
+      // a capability hidden with uiComponent:null reaches the tag picker
+      // without a value.
+      // MUST stay second: getCapability() returns capabilities[0], which the
+      // set-hot-water-mode flow card resolves to.
+      {
+        capabilityName: 'measure_hot_water_mode',
+        propertyPath: 'value.value',
+        valueMapping: {
+          efficient: 'Eco',
+          efficientWithMinComfort: 'Comfort',
+          off: 'Off',
+          eco: 'Eco',
+          comfort: 'Comfort',
+          balanced: 'Balanced',
+        },
+        capabilityOptions: {
+          title: { en: 'Hot water mode' },
+          preventInsights: true,
+          preventTag: false,
+        },
+      }],
+    },
+    [PATHS.HEATING_CIRCUIT_0_PROGRAM_ACTIVE]: {
+      capabilities: [{
+        capabilityName: 'measure_heating_program',
+        propertyPath: 'value.value',
+        // The API reports the raw program name. Map the ones a user acts on to
+        // the same words the flow card uses; anything else (standby,
+        // frostprotection, summerEco, …) falls through unmapped rather than
+        // being hidden behind a wrong label.
+        valueMapping: {
+          comfortHeating: 'Comfort',
+          comfort: 'Comfort',
+          normalHeating: 'Normal',
+          normal: 'Normal',
+          reducedHeating: 'Eco (reduced)',
+          reduced: 'Eco (reduced)',
+        },
+        capabilityOptions: {
+          title: { en: 'Heating program' },
+          preventInsights: true,
+          preventTag: false,
+        },
+      }],
+    },
     // Compressor speed and primary fan modulation feed the live-wattage
     // estimate computed in device.js. No Homey capability of their own.
     [PATHS.COMPRESSOR_SPEED]: { capabilities: [] },

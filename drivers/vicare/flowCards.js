@@ -55,6 +55,28 @@ module.exports = {
         ],
       }],
     },
+    // Comfort / Eco cannot be driven through a capability like the other
+    // actions: on E3 devices the operating.programs.* activate commands are
+    // read-only and the schedule has to be rewritten instead. deviceMethod
+    // routes this card straight to the device method rather than through the
+    // generic capability -> executeCommand path in driver.js.
+    SET_HEATING_PROGRAM: {
+      id: 'set-heating-program',
+      deviceMethod: 'setHeatingProgram',
+      title: 'flow.actions.heating_program.title',
+      titleFormatted: 'flow.actions.heating_program.titleFormatted',
+      hint: 'flow.actions.heating_program.hint',
+      args: [{
+        name: 'program',
+        type: 'dropdown',
+        values: [
+          { id: 'comfort', title: 'flow.actions.heating_program.values.comfort' },
+          { id: 'normal', title: 'flow.actions.heating_program.values.normal' },
+          { id: 'eco', title: 'flow.actions.heating_program.values.eco' },
+          { id: 'auto', title: 'flow.actions.heating_program.values.auto' },
+        ],
+      }],
+    },
     SET_HEATING_TEMPERATURE: {
       id: 'set-heating-thermostat',
       capability: getCapability(PATHS.HEATING_CIRCUIT_0_TARGET).capabilityName,
@@ -95,6 +117,28 @@ module.exports = {
         values: [
           { id: 'activate', title: 'flow.actions.dhw_charge.values.activate' },
           { id: 'deactivate', title: 'flow.actions.dhw_charge.values.deactivate' },
+        ],
+      }],
+    },
+    SET_DHW_MODE: {
+      id: 'set-hot-water-mode',
+      capability: getCapability(PATHS.HOT_WATER_MODE).capabilityName,
+      method: 'setDhwMode',
+      title: 'flow.actions.dhw_mode.title',
+      titleFormatted: 'flow.actions.dhw_mode.titleFormatted',
+      hint: 'flow.actions.dhw_mode.hint',
+      args: [{
+        name: 'mode',
+        type: 'dropdown',
+        // Ordered so the heat pump modes — the ones ViCare calls Eco and
+        // Comfort — come first, with the boiler-only modes last and labelled.
+        values: [
+          { id: 'efficient', title: 'flow.actions.dhw_mode.values.efficient' },
+          { id: 'efficientWithMinComfort', title: 'flow.actions.dhw_mode.values.efficientWithMinComfort' },
+          { id: 'off', title: 'flow.actions.dhw_mode.values.off' },
+          { id: 'eco', title: 'flow.actions.dhw_mode.values.eco' },
+          { id: 'comfort', title: 'flow.actions.dhw_mode.values.comfort' },
+          { id: 'balanced', title: 'flow.actions.dhw_mode.values.balanced' },
         ],
       }],
     },
