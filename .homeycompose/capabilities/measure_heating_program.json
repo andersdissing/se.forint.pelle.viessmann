@@ -1,0 +1,10 @@
+{
+  "type": "string",
+  "title": {
+    "en": "Heating program"
+  },
+  "getable": true,
+  "setable": false,
+  "uiComponent": "sensor",
+  "icon": "/assets/info.svg"
+}

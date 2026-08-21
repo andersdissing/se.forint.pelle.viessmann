@@ -96,6 +96,14 @@ module.exports = class ViessmannDriver extends OAuth2Driver {
         flowCard.registerRunListener(async (args, state) => {
           const { device, ...actionArgs } = args;
 
+          // Actions that cannot be expressed as a single capability command
+          // (e.g. set-heating-program, which rewrites the weekly schedule)
+          // name a device method instead.
+          if (action.deviceMethod) {
+            const value = actionArgs[Object.keys(actionArgs)[0]];
+            return device[action.deviceMethod](value);
+          }
+
           // Hitta path och capability från FEATURES
           for (const [path, feature] of Object.entries(FEATURES)) {
             const capability = feature.capabilities?.find((cap) => cap.capabilityName === action.capability);

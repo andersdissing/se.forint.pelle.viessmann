@@ -174,6 +174,55 @@
         }
       },
       {
+        "id": "set-heating-program",
+        "title": {
+          "en": "Set heating program"
+        },
+        "titleFormatted": {
+          "en": "Set heating program to [[program]]"
+        },
+        "args": [
+          {
+            "type": "device",
+            "name": "device",
+            "filter": "driver_id=vicare"
+          },
+          {
+            "name": "program",
+            "type": "dropdown",
+            "values": [
+              {
+                "id": "comfort",
+                "title": {
+                  "en": "Comfort"
+                }
+              },
+              {
+                "id": "normal",
+                "title": {
+                  "en": "Normal"
+                }
+              },
+              {
+                "id": "eco",
+                "title": {
+                  "en": "Eco (reduced)"
+                }
+              },
+              {
+                "id": "auto",
+                "title": {
+                  "en": "Back to my schedule"
+                }
+              }
+            ]
+          }
+        ],
+        "hint": {
+          "en": "Overrides the weekly time program of heating circuit 0. Comfort, Normal and Eco apply around the clock until you choose 'Back to my schedule', which restores the schedule that was in place before the first override. Eco uses the installation's reduced level."
+        }
+      },
+      {
         "id": "set-heating-thermostat",
         "title": {
           "en": "Set heating target temperature to [[temperature]] °C"
@@ -258,6 +307,67 @@
             ]
           }
         ]
+      },
+      {
+        "id": "set-hot-water-mode",
+        "title": {
+          "en": "Set hot water mode"
+        },
+        "titleFormatted": {
+          "en": "Set hot water mode to [[mode]]"
+        },
+        "args": [
+          {
+            "type": "device",
+            "name": "device",
+            "filter": "driver_id=vicare"
+          },
+          {
+            "name": "mode",
+            "type": "dropdown",
+            "values": [
+              {
+                "id": "efficient",
+                "title": {
+                  "en": "Eco"
+                }
+              },
+              {
+                "id": "efficientWithMinComfort",
+                "title": {
+                  "en": "Comfort"
+                }
+              },
+              {
+                "id": "off",
+                "title": {
+                  "en": "Off"
+                }
+              },
+              {
+                "id": "eco",
+                "title": {
+                  "en": "Eco (boiler)"
+                }
+              },
+              {
+                "id": "comfort",
+                "title": {
+                  "en": "Comfort (boiler)"
+                }
+              },
+              {
+                "id": "balanced",
+                "title": {
+                  "en": "Balanced (boiler)"
+                }
+              }
+            ]
+          }
+        ],
+        "hint": {
+          "en": "Hot water has its own operating mode, separate from the heating circuit — this is the Eco/Comfort setting shown under hot water in the ViCare app. Heat pumps offer Eco, Comfort and Off; the modes marked (boiler) exist only on boilers and will be refused on a heat pump."
+        }
       },
       {
         "id": "set-hot-water-thermostat2",
@@ -538,6 +648,26 @@
       "setable": false,
       "uiComponent": "sensor",
       "icon": "/assets/fuelcell.svg"
+    },
+    "measure_heating_program": {
+      "type": "string",
+      "title": {
+        "en": "Heating program"
+      },
+      "getable": true,
+      "setable": false,
+      "uiComponent": "sensor",
+      "icon": "/assets/info.svg"
+    },
+    "measure_hot_water_mode": {
+      "type": "string",
+      "title": {
+        "en": "Hot water mode"
+      },
+      "getable": true,
+      "setable": false,
+      "uiComponent": "sensor",
+      "icon": "/assets/info.svg"
     },
     "measure_something_active": {
       "type": "boolean",

@@ -29,7 +29,11 @@ module.exports = class ViessmannDevice extends OAuth2Device {
 
   static FEATURES = FEATURES;
   static PATHS = PATHS;
-  static STATIC_CAPABILITIES = ['button.refresh'];
+  // No static capabilities. button.refresh used to live here; removing it from
+  // this list is also what retires it from already-paired devices, because the
+  // cleanup pass in initializeCapabilities drops any capability that is
+  // neither static nor backed by a configured feature.
+  static STATIC_CAPABILITIES = [];
   // If the Viessmann API timestamp on the summary.* features stops
   // advancing for longer than this, assume the heat pump is idle and
   // force measure_power to 0. Otherwise the capability stays stuck at
@@ -65,13 +69,8 @@ module.exports = class ViessmannDevice extends OAuth2Device {
 
     await this.initializeCapabilities();
     await this.initializeOperatingModes();
+    await this.initializeDhwModes();
     await this.registerCapabilityListeners();
-
-    this.registerCapabilityListener('button.refresh', async () => {
-      this.log('Manual refresh requested');
-      const deviceKey = `${this._installationId}-${this._gatewaySerial}-${this._deviceId}`;
-      await this.driver._startPolling(this, deviceKey);
-    });
 
     const lastMeasurePower = this.getStoreValue('lastMeasurePower');
     if (typeof lastMeasurePower === 'number') {
@@ -199,6 +198,40 @@ module.exports = class ViessmannDevice extends OAuth2Device {
     }
   }
 
+  /*
+   * The hot water mode capability is declared with the union of the modes seen
+   * across device generations, because a device paired on one generation must
+   * not be offered another's vocabulary. The installation reports the modes it
+   * actually accepts in the setMode constraints, so prune the picker down to
+   * those. Same idea as initializeOperatingModes, for the dhw side.
+   */
+  async initializeDhwModes() {
+    try {
+      const { capabilityName } = getCapability(PATHS.HOT_WATER_MODE);
+      if (!this.hasCapability(capabilityName)) return;
+
+      const supported = this._constraints?.[PATHS.HOT_WATER_MODE]?.mode?.enum;
+      if (!Array.isArray(supported) || supported.length === 0) return;
+
+      // Start from the options in config, NOT from the ones already stored on
+      // the device: once pruned, the stored copy has the right ids forever and
+      // would never pick up a corrected label. Shallow-copy so the shared
+      // config object is not mutated.
+      const declared = getCapabilityOptions(capabilityName);
+      const pruned = (declared.values || []).filter((value) => supported.includes(value.id));
+      if (pruned.length === 0) return;
+
+      await this.setCapabilityOptions(capabilityName, { ...declared, values: pruned });
+      if (process.env.DEBUG) {
+        this.log('[ViessmannDevice::initializeDhwModes] hot water modes limited to:', supported.join(', '));
+      }
+    } catch (err) {
+      if (process.env.DEBUG) {
+        this.log('Error initializing hot water modes:', err);
+      }
+    }
+  }
+
   async registerCapabilityListeners() {
     for (const path of Object.values(PATHS)) {
       try {
@@ -247,6 +280,8 @@ module.exports = class ViessmannDevice extends OAuth2Device {
           parameters[apiParam] = value;
         }
 
+        this.assertParametersAllowed(path, parameters);
+
         await this.oAuth2Client.executeCommand({
           installationId: this._installationId,
           gatewaySerial: this._gatewaySerial,
@@ -258,12 +293,168 @@ module.exports = class ViessmannDevice extends OAuth2Device {
       }
     } catch (error) {
       this.log('Error executing command:', error);
-      // throw error with message
-      throw new Error('Error executing command', error);
+      // Keep the reason. `new Error(msg, error)` silently drops the second
+      // argument — it is an options bag, not a cause — which is why every
+      // failure used to reach the user as a bare "Error executing command".
+      throw new Error(`Error executing command: ${error.message}`, { cause: error });
     }
-    // Uppdate capability value 
-    await this.setCapabilityValueIfPossible(capability.capabilityName, value);
+    // Update every capability fed by this feature, not just the one that was
+    // written. heating.dhw.operating.modes.active backs two: the picker
+    // (raw id) and measure_hot_water_mode (the label used as a flow tag).
+    // Updating only the picker left the tag reporting the previous mode until
+    // the next poll — up to a full poll interval — so a flow that set the mode
+    // and then read the tag got a stale answer.
+    // setCapabilityValueIfPossible applies each capability's own valueMapping,
+    // so the raw API value is the right thing to hand to all of them.
+    let capabilities;
+    try {
+      capabilities = getAllCapabilities(path);
+    } catch (err) {
+      capabilities = [capability];
+    }
+    for (const target of capabilities) {
+      if (target.derived) continue;
+      await this.setCapabilityValueIfPossible(target.capabilityName, value);
+    }
     return true;
+  }
+
+  /*
+   * Select the Comfort / Normal / Eco temperature level for heating circuit 0.
+   *
+   * WHY THIS GOES THROUGH THE SCHEDULE: the obvious route —
+   * heating.circuits.0.operating.programs.comfort.activate — does not exist on
+   * E3 devices. There the programs are named comfortHeating / normalHeating /
+   * reducedHeating and their activate/deactivate commands are reported as
+   * isExecutable:false, i.e. read-only. Verified against a Vitocal 222S
+   * (E3_Vitocal_16) on 2026-08-13.
+   *
+   * What IS writable is heating.circuits.0.heating.schedule, whose setSchedule
+   * command is constrained to modes ["normal","comfort"] with
+   * defaultMode "reduced". So:
+   *
+   *   comfort/normal -> write an all-day entry with that mode
+   *   eco            -> write an empty schedule; every hour then falls back to
+   *                     the constraint's defaultMode ("reduced")
+   *   auto           -> put the user's own schedule back
+   *
+   * Because this overwrites the user's weekly program, the original is saved
+   * to the device store on the first override and restored by 'auto'.
+   */
+  static SCHEDULE_DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+  static SCHEDULE_BACKUP_KEY = 'scheduleOverride';
+
+  async setHeatingProgram(program) {
+    const path = PATHS.HEATING_CIRCUIT_0_SCHEDULE;
+    const feature = await this.getScheduleFeature(path);
+
+    const setSchedule = feature?.commands?.setSchedule;
+    if (!setSchedule) {
+      throw new Error(`This installation does not expose ${path}/commands/setSchedule, so the heating program cannot be changed.`);
+    }
+    if (setSchedule.isExecutable === false) {
+      throw new Error(`${path}/commands/setSchedule is read-only on this installation.`);
+    }
+
+    const constraints = setSchedule.params?.newSchedule?.constraints || {};
+    const availableModes = constraints.modes || [];
+    const currentSchedule = feature.properties?.entries?.value;
+    const backup = this.getStoreValue(this.constructor.SCHEDULE_BACKUP_KEY);
+
+    let newSchedule;
+    if (program === 'auto') {
+      if (!backup?.original) {
+        this.log('setHeatingProgram(auto): no override active, leaving the schedule untouched');
+        return true;
+      }
+      newSchedule = backup.original;
+    } else if (program === 'eco') {
+      // Empty schedule -> nothing is scheduled -> defaultMode ("reduced")
+      // applies around the clock. Confirmed accepted by the API.
+      newSchedule = this.buildEmptySchedule();
+    } else if (program === 'comfort' || program === 'normal') {
+      if (availableModes.length > 0 && !availableModes.includes(program)) {
+        throw new Error(`This installation only supports the schedule modes [${availableModes.join(', ')}], not "${program}".`);
+      }
+      newSchedule = this.buildAllDaySchedule(program);
+    } else {
+      throw new Error(`Unknown heating program: ${program}`);
+    }
+
+    // Save the user's own schedule before the first override, never over an
+    // override we wrote ourselves.
+    if (program !== 'auto' && !backup?.original && currentSchedule) {
+      await this.setStoreValue(this.constructor.SCHEDULE_BACKUP_KEY, {
+        original: currentSchedule,
+        savedAt: new Date().toISOString(),
+      });
+      this.log('setHeatingProgram: saved the original weekly schedule before overriding it');
+    }
+
+    await this.oAuth2Client.executeCommand({
+      installationId: this._installationId,
+      gatewaySerial: this._gatewaySerial,
+      deviceId: this._deviceId,
+      feature: path,
+      command: 'setSchedule',
+      body: { newSchedule },
+    });
+    this.log(`setHeatingProgram: ${program} applied`);
+
+    if (program === 'auto') {
+      await this.unsetStoreValue(this.constructor.SCHEDULE_BACKUP_KEY);
+      this.log('setHeatingProgram: original schedule restored, override cleared');
+    }
+
+    return true;
+  }
+
+  async getScheduleFeature(featureName) {
+    const response = await this.oAuth2Client.getFeature({
+      installationId: this._installationId,
+      gatewaySerial: this._gatewaySerial,
+      deviceId: this._deviceId,
+      featureName,
+    });
+    // A single-feature GET returns { data: {...} }; the collection endpoint
+    // returns { data: [...] }. Accept either so this keeps working if the
+    // client is ever pointed at the filtered list endpoint.
+    const { data } = response || {};
+    if (Array.isArray(data)) {
+      return data.find((f) => f.feature === featureName);
+    }
+    return data;
+  }
+
+  buildEmptySchedule() {
+    return Object.fromEntries(this.constructor.SCHEDULE_DAYS.map((day) => [day, []]));
+  }
+
+  buildAllDaySchedule(mode) {
+    const entry = [{
+      mode, start: '00:00', end: '24:00', position: 0,
+    }];
+    return Object.fromEntries(this.constructor.SCHEDULE_DAYS.map((day) => [day, entry]));
+  }
+
+  /*
+   * Flow card dropdowns are generated once for the whole app, so they offer
+   * every value any device generation supports — the hot water card lists
+   * eco/comfort/balanced, which an E3 heat pump rejects with a 400. The
+   * installation already told us what it accepts when the device was paired,
+   * so check that first and name the supported values instead of spending an
+   * API call to be told no.
+   */
+  assertParametersAllowed(path, parameters) {
+    const constraints = this._constraints && this._constraints[path];
+    if (!constraints) return;
+
+    for (const [name, value] of Object.entries(parameters)) {
+      const allowed = constraints[name] && constraints[name].enum;
+      if (Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(value)) {
+        throw new Error(`"${value}" is not supported by this installation. Supported values: ${allowed.join(', ')}`);
+      }
+    }
   }
 
   async checkUpgradeSpecifics() {
@@ -350,6 +541,44 @@ module.exports = class ViessmannDevice extends OAuth2Device {
       this.setStoreValue('features', features);
       this.setStoreValue('constraints', constraints);
       this.setStoreValue('version', '1.0.17');
+    }
+    // 1.0.18: measure_heating_program shows which temperature level the
+    // circuit is on (Comfort / Normal / Eco). Refresh _features so the newly
+    // configured programs.active path is recognised on devices that were
+    // paired before it existed — without this the capability is never added.
+    if (this.storeVersionBefore('1.0.18')) {
+      this.log('Upgrading to 1.0.18: refreshing features for the heating-program capability');
+      const installationId = this.getStoreValue('installationId');
+      const gatewaySerial = this.getStoreValue('gatewaySerial');
+      const deviceId = this.getStoreValue('deviceId');
+      const { features, constraints } = await this.driver._getEnabledFeaturesAndOpModes(this.oAuth2Client, installationId, gatewaySerial, deviceId);
+      this.setStoreValue('features', features);
+      this.setStoreValue('constraints', constraints);
+      this.setStoreValue('version', '1.0.18');
+    }
+    // 1.0.19: thermostat_mode.hotWater exposes heating.dhw.operating.modes.active.
+    // Refresh features AND constraints — the constraints are what
+    // initializeDhwModes uses to prune the mode picker to this installation.
+    if (this.storeVersionBefore('1.0.19')) {
+      this.log('Upgrading to 1.0.19: refreshing features for the hot water mode capability');
+      const installationId = this.getStoreValue('installationId');
+      const gatewaySerial = this.getStoreValue('gatewaySerial');
+      const deviceId = this.getStoreValue('deviceId');
+      const { features, constraints } = await this.driver._getEnabledFeaturesAndOpModes(this.oAuth2Client, installationId, gatewaySerial, deviceId);
+      this.setStoreValue('features', features);
+      this.setStoreValue('constraints', constraints);
+      this.setStoreValue('version', '1.0.19');
+    }
+    // 1.0.20: measure_hot_water_mode was first shipped with uiComponent:null,
+    // which left its flow tag without a value. capabilityOptions are only
+    // written when a capability is added, so drop it here and let
+    // initializeCapabilities add it back with the corrected options.
+    if (this.storeVersionBefore('1.0.20')) {
+      this.log('Upgrading to 1.0.20: re-adding measure_hot_water_mode so its flow tag carries a value');
+      if (this.hasCapability('measure_hot_water_mode')) {
+        await this.removeCapability('measure_hot_water_mode');
+      }
+      this.setStoreValue('version', '1.0.20');
     }
   }
 
